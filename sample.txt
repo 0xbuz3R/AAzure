@@ -202,3 +202,154 @@ Port/service exposure by IP: https://www.shodan.io — search the public IP dire
 Subdomain discovery beyond your known list: https://crt.sh search on your root company domain — catches things not in your 196 Azure resources (other subscriptions, shadow IT).
 
 Log each into your sheet: Endpoint | DNS Resolves? | TLS Valid? | HTTP Status | Notes.
+
+
+
+## Resorcesss
+
+Types worth checking externally (public-facing potential)
+
+API Management, Container App, Container App Environment, Foundry, IoT Hub, App Service Domain, Key Vault, Logic App, ML Workspace, Load Balancer, Storage Account, API Connections, App Service, VMs (via NIC/Public IP)
+
+Types to skip (no direct external exposure)
+
+Disk, Action Group, App Insights, Log Search Alert Rule, Workbook, App Service Plan, Network Interface (only matters if it has a public IP attached — checked via VM/LB queries below)
+
+1. API Management
+kql
+Resources
+| where type =~ 'microsoft.apimanagement/service'
+| project name, resourceGroup,
+    gatewayUrl = properties.gatewayUrl,
+    portalUrl = properties.portalUrl,
+    publicIpAddresses = properties.publicIPAddresses,
+    publicNetworkAccess = properties.publicNetworkAccess
+2. Container Apps + Environment
+kql
+Resources
+| where type =~ 'microsoft.app/containerapps'
+| project name, resourceGroup,
+    fqdn = properties.configuration.ingress.fqdn,
+    external = properties.configuration.ingress.external
+kql
+Resources
+| where type =~ 'microsoft.app/managedenvironments'
+| project name, resourceGroup,
+    staticIp = properties.staticIp,
+    defaultDomain = properties.defaultDomain,
+    publicAccess = properties.publicNetworkAccess
+3. Foundry (Azure AI Foundry / AI Services)
+kql
+Resources
+| where type =~ 'microsoft.cognitiveservices/accounts'
+   or type =~ 'microsoft.machinelearningservices/workspaces/connections'
+| project name, resourceGroup, type,
+    endpoint = properties.endpoint,
+    publicAccess = properties.publicNetworkAccess
+
+(Foundry resource type names vary by API version — if this returns empty, tell me and I'll adjust; check the exact type value from your summarize count() by type output.)
+
+4. IoT Hub
+kql
+Resources
+| where type =~ 'microsoft.devices/iothubs'
+| project name, resourceGroup,
+    hostName = properties.hostName,
+    publicAccess = properties.publicNetworkAccess
+5. App Service Domain
+kql
+Resources
+| where type =~ 'microsoft.domainregistration/domains'
+| project name, resourceGroup,
+    hostNames = properties.nameServers,
+    domainStatus = properties.domainStatus
+6. Key Vault
+kql
+Resources
+| where type =~ 'microsoft.keyvault/vaults'
+| project name, resourceGroup,
+    vaultUri = properties.vaultUri,
+    publicAccess = properties.publicNetworkAccess,
+    networkDefault = properties.networkAcls.defaultAction
+7. Logic App
+kql
+Resources
+| where type =~ 'microsoft.logic/workflows'
+| project name, resourceGroup,
+    accessEndpoint = properties.accessEndpoint,
+    state = properties.state
+8. ML Workspace
+kql
+Resources
+| where type =~ 'microsoft.machinelearningservices/workspaces'
+| project name, resourceGroup,
+    discoveryUrl = properties.discoveryUrl,
+    publicAccess = properties.publicNetworkAccess
+9. Load Balancer (public-facing ones)
+kql
+Resources
+| where type =~ 'microsoft.network/loadbalancers'
+| extend frontendIps = properties.frontendIPConfigurations
+| project name, resourceGroup, frontendIps
+
+(You'll need to expand frontendIps — if publicIPAddress.id is populated, it's internet-facing; if it references a private IP config, it's internal-only.)
+
+10. Storage Account
+kql
+Resources
+| where type =~ 'microsoft.storage/storageaccounts'
+| project name, resourceGroup,
+    blobEndpoint = properties.primaryEndpoints.blob,
+    publicAccess = properties.publicNetworkAccess,
+    blobPublicAccess = properties.allowBlobPublicAccess,
+    networkDefault = properties.networkAcls.defaultAction
+11. API Connections (used by Logic Apps — check for exposed auth)
+kql
+Resources
+| where type =~ 'microsoft.web/connections'
+| project name, resourceGroup,
+    displayName = properties.displayName,
+    api = properties.api.id,
+    status = properties.statuses
+12. App Service
+kql
+Resources
+| where type =~ 'microsoft.web/sites'
+| project name, resourceGroup,
+    hostName = properties.defaultHostName,
+    publicAccess = properties.publicNetworkAccess,
+    httpsOnly = properties.httpsOnly
+13. VMs → via Network Interface → Public IP chain
+kql
+Resources
+| where type =~ 'microsoft.compute/virtualmachines'
+| project vmName = name, resourceGroup, nics = properties.networkProfile.networkInterfaces
+
+Then separately:
+
+kql
+Resources
+| where type =~ 'microsoft.network/networkinterfaces'
+| mv-expand ipConfig = properties.ipConfigurations
+| where isnotnull(ipConfig.properties.publicIPAddress)
+| project nicName = name, resourceGroup, publicIpId = ipConfig.properties.publicIPAddress.id
+
+Join the publicIpId back to your Public IP query to get the actual address.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
