@@ -325,6 +325,16 @@ Resources
 | where type =~ 'microsoft.compute/virtualmachines'
 | project vmName = name, resourceGroup, nics = properties.networkProfile.networkInterfaces
 
+14. Namespaces
+
+Resources
+| where type =~ 'microsoft.servicebus/namespaces'
+| project name, resourceGroup,
+    serviceBusEndpoint = properties.serviceBusEndpoint,
+    publicNetworkAccess = properties.publicNetworkAccess,
+    networkDefault = properties.networkRuleSet.defaultAction
+
+
 Then separately:
 
 kql
