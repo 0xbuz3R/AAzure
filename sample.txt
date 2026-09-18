@@ -1,0 +1,204 @@
+Step 1 — Get the authoritative inventory (you've done this)
+
+Using Reader + Resource Graph, you already pulled all 196 resources and filtered for ones with publicNetworkAccess, public IPs, open NSGs, etc. This gives you a list of candidate exposed resources with their names, types, resource groups.
+
+➡️ Output: a spreadsheet/CSV — ResourceName | Type | RG | PublicAccessConfig | Endpoint/URL/IP
+
+Step 2 — Extract the actual internet-facing identifiers from that list
+
+For each flagged resource, pull the specific thing an attacker would actually connect to:
+
+Storage account → <name>.blob.core.windows.net
+App Service → <name>.azurewebsites.net or custom domain
+Public IP → the IP itself
+SQL Server → <name>.database.windows.net
+Key Vault → <name>.vault.azure.net
+bash
+az resource show --ids <resource-id> --query "properties"
+
+(to get the exact hostname/FQDN field per resource type — property names vary, this is where you spend most manual time)
+
+➡️ Output: a flat list of hostnames/IPs — this is your target list for external recon (not exploitation, just confirming reachability/behavior).
+
+Step 3 — External/passive validation of each target
+
+For every hostname/IP from Step 2, passively check what the outside world sees:
+
+bash
+# DNS resolution — does it even resolve publicly?
+dig +short <hostname>
+
+# TLS cert info — what's exposed, any extra SANs revealing more hosts?
+echo | openssl s_client -connect <hostname>:443 -servername <hostname> 2>/dev/null | openssl x509 -noout -text
+
+# HTTP response — status code + headers only, no crawling/fuzzing
+curl -sI https://<hostname>
+
+# Shodan/Censys lookup by IP — what ports/services are seen from outside
+
+Record: DNS resolves? TLS valid? HTTP status (200/403/404/timeout)? Any WAF/CDN in front (via headers)?
+
+Step 4 — Widen the net beyond your known list (find what Azure/Reader missed)
+
+This catches shadow IT / forgotten resources not in your current subscription, or things provisioned outside IaC:
+
+crt.sh (Certificate Transparency) for %.yourcompany.com and %.azurewebsites.net if custom domain isn't obvious
+Subfinder/Amass against your company's root domain(s)
+Shodan/Censys search by org name, or by Azure IP ranges + your known ASN
+GitHub dorking for leaked subscription IDs, storage account names, connection strings in public repos
+
+➡️ Anything found here that does not map back to your Step 1 inventory = either a resource in a subscription you don't have Reader on, or truly shadow/unmanaged — flag as a priority finding.
+
+Step 5 — Correlate and classify every finding
+
+For each target, classify it as one of:
+
+Exposed & open — resolves, responds 200, no auth control visible → high priority
+Exposed & restricted — resolves, responds 403/401 → control working, still document (as discussed last message)
+Not externally reachable — Azure says "public" but doesn't actually resolve/respond (e.g., private endpoint override, or DNS not delegated) → note the config drift
+Unknown/shadow — found externally but not in your Reader inventory → escalate immediately
+
+
+
+##### NXT STEPSS ############
+
+
+
+
+
+Step 1 — Baseline inventory
+
+Paste into Resource Graph Explorer:
+
+kql
+Resources
+| project name, type, resourceGroup, location, id
+| order by type asc
+
+Click Run query → Download as CSV → save as all_resources.csv. Confirm it shows ~196 rows.
+
+Step 2 — Flag exposed candidates (generic pass)
+kql
+Resources
+| extend publicAccess = tostring(properties.publicNetworkAccess),
+         networkDefaultAction = tostring(properties.networkAcls.defaultAction),
+         blobPublicAccess = tostring(properties.allowBlobPublicAccess)
+| where publicAccess =~ 'Enabled'
+   or networkDefaultAction =~ 'Allow'
+   or blobPublicAccess =~ 'true'
+   or type =~ 'microsoft.network/publicipaddresses'
+| project name, type, resourceGroup, publicAccess, networkDefaultAction, blobPublicAccess, id
+| order by type asc
+
+Download as CSV → exposed_candidates.csv.
+
+Step 3 — Per-type endpoint extraction (run each, download each, merge later in Excel)
+
+Storage accounts:
+
+kql
+Resources
+| where type =~ 'microsoft.storage/storageaccounts'
+| project name, resourceGroup,
+    blobEndpoint = properties.primaryEndpoints.blob,
+    publicAccess = properties.publicNetworkAccess,
+    blobPublicAccess = properties.allowBlobPublicAccess,
+    networkDefault = properties.networkAcls.defaultAction
+
+App Services / Function Apps:
+
+kql
+Resources
+| where type =~ 'microsoft.web/sites'
+| project name, resourceGroup,
+    hostName = properties.defaultHostName,
+    publicAccess = properties.publicNetworkAccess,
+    httpsOnly = properties.httpsOnly
+
+SQL Servers:
+
+kql
+Resources
+| where type =~ 'microsoft.sql/servers'
+| project name, resourceGroup,
+    fqdn = properties.fullyQualifiedDomainName,
+    publicAccess = properties.publicNetworkAccess
+
+Cosmos DB:
+
+kql
+Resources
+| where type =~ 'microsoft.documentdb/databaseaccounts'
+| project name, resourceGroup,
+    endpoint = properties.documentEndpoint,
+    publicAccess = properties.publicNetworkAccess,
+    ipRules = properties.ipRules
+
+Key Vaults:
+
+kql
+Resources
+| where type =~ 'microsoft.keyvault/vaults'
+| project name, resourceGroup,
+    vaultUri = properties.vaultUri,
+    publicAccess = properties.publicNetworkAccess,
+    networkDefault = properties.networkAcls.defaultAction
+
+Public IPs (with what they're attached to):
+
+kql
+Resources
+| where type =~ 'microsoft.network/publicipaddresses'
+| project name, resourceGroup,
+    ipAddress = properties.ipAddress,
+    attachedTo = properties.ipConfiguration.id,
+    fqdn = properties.dnsSettings.fqdn
+
+Container Registries:
+
+kql
+Resources
+| where type =~ 'microsoft.containerregistry/registries'
+| project name, resourceGroup,
+    loginServer = properties.loginServer,
+    publicAccess = properties.publicNetworkAccess
+
+AKS clusters:
+
+kql
+Resources
+| where type =~ 'microsoft.containerservice/managedclusters'
+| project name, resourceGroup,
+    fqdn = properties.fqdn,
+    privateCluster = properties.apiServerAccessProfile.enablePrivateCluster
+
+Download each result as CSV, then paste them all into one Excel/Google Sheet tab — you'll end up with a clean Name | Type | RG | Endpoint | PublicAccessConfig master list.
+
+Step 4 — NSG inbound rules open to internet (separate, since it's nested data)
+kql
+Resources
+| where type =~ 'microsoft.network/networksecuritygroups'
+| mv-expand rule = properties.securityRules
+| where rule.properties.direction =~ 'Inbound'
+  and rule.properties.access =~ 'Allow'
+  and (rule.properties.sourceAddressPrefix in ('*', '0.0.0.0/0', 'Internet'))
+| project nsgName = name, resourceGroup,
+    ruleName = rule.name,
+    port = rule.properties.destinationPortRange,
+    protocol = rule.properties.protocol,
+    source = rule.properties.sourceAddressPrefix
+Step 5 — Build your external target list (manual, in Excel)
+
+From the master CSV, pull just the endpoint/hostname/IP column into a new sheet — this is your list of URLs/IPs to check externally.
+
+Step 6 — External validation (no CLI/az needed — just browser + free web tools)
+
+For each endpoint in your list, check manually or with free online tools (no installs needed):
+
+DNS resolution: https://dnschecker.org or nslookup <hostname> in Windows CMD / dig <hostname> in any terminal (this is just OS-level DNS, not Azure CLI).
+TLS/cert info + extra hostnames: https://crt.sh/?q=%25.yourdomain.com or https://www.ssllabs.com/ssltest/.
+HTTP status/headers: https://httpstatus.io (paste the URL, get status code + full headers without needing curl).
+Port/service exposure by IP: https://www.shodan.io — search the public IP directly, free account gives you open ports/banners.
+Subdomain discovery beyond your known list: https://crt.sh search on your root company domain — catches things not in your 196 Azure resources (other subscriptions, shadow IT).
+
+Log each into your sheet: Endpoint | DNS Resolves? | TLS Valid? | HTTP Status | Notes.
